@@ -1,0 +1,3 @@
+from .delan_f2 import DeepLagrangianNetwork as DeepLagrangianNetwork_f2
+from .delan_f1 import DeepLagrangianNetwork as DeepLagrangianNetwork_f1
+from .delan_f3 import DeepLagrangianNetwork as DeepLagrangianNetwork_f3
