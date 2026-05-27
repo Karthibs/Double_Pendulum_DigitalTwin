@@ -64,8 +64,8 @@ if __name__ == "__main__":
              'n_minibatch': 512,
              'learning_rate': 5.e-04,
              'weight_decay': 1.e-5,
-             #'max_epoch': 10000
-             'max_epoch': 6000}
+             'max_epoch': 200}
+             #'max_epoch': 6000}
 
     # Load existing model parameters:
     if load_model:
@@ -79,7 +79,8 @@ if __name__ == "__main__":
 
         state = torch.load(load_file, weights_only=False, map_location=device)
 
-        delan_model = DeepLagrangianNetwork(n_dof, **state['hyper'])
+        delan_model = DeepLagrangianNetwork(n_dof, **state['hyper'],
+                                            use_friction=True,friction_hidden=(32, 32))
         delan_model.load_state_dict(state['state_dict'])
         delan_model.to(device)
         delan_model.eval()
@@ -103,46 +104,63 @@ if __name__ == "__main__":
     t0_start = time.perf_counter()
 
     epoch_i = 0
+
+    lambda_power = 1.e-2  # ~500 epoch
+    lambda_diss = 1.e-3  #
+    warmup_energy_epochs = 100
+
     while epoch_i < hyper['max_epoch'] and not load_model:
         l_mem_mean_inv_dyn, l_mem_var_inv_dyn = 0.0, 0.0
         l_mem_mean_dEdt, l_mem_var_dEdt = 0.0, 0.0
+        l_mem_mean_diss = 0.0
         l_mem, n_batches = 0.0, 0.0
+
+
+        lam_E = lambda_power if epoch_i >= warmup_energy_epochs else 0.0
+        lam_D = lambda_diss
 
         for q, qd, qdd, tau in mem:
             t0_batch = time.perf_counter()
 
-            # Reset gradients:
             optimizer.zero_grad()
 
-            # Compute the Rigid Body Dynamics Model:
-            tau_hat, dEdt_hat = delan_model(q, qd, qdd)
+            # τ_f = ∂R/∂qd
+            qd = qd.detach().requires_grad_(True)
 
-            # Compute the loss of the Euler-Lagrange Differential Equation:
+
+            tau_hat, dEdt_hat, tau_f_hat, p_diss_hat = delan_model(q, qd, qdd)
+
+
+
+            #normalized_err = (tau_hat - tau) / self.tau_std
             err_inv = torch.sum((tau_hat - tau) ** 2, dim=1)
             l_mean_inv_dyn = torch.mean(err_inv)
             l_var_inv_dyn = torch.var(err_inv)
 
-            # Compute the loss of the Power Conservation:
-            dEdt = torch.matmul(qd.view(-1, 2, 1).transpose(dim0=1, dim1=2), tau.view(-1, 2, 1)).view(-1)
-            err_dEdt = (dEdt_hat - dEdt) ** 2
+
+            #   dE/dt = q̇ᵀτ_ctrl  -  P_diss
+            P_ctrl = (qd * tau).sum(dim=1)
+            err_dEdt = (dEdt_hat - (P_ctrl - p_diss_hat)) ** 2
             l_mean_dEdt = torch.mean(err_dEdt)
             l_var_dEdt = torch.var(err_dEdt)
 
-            # Compute gradients & update the weights:
-            #loss = l_mean_inv_dyn + l_mem_mean_dEdt
-            lambda_power = 1.e-3
-            loss = l_mean_inv_dyn + lambda_power * l_mean_dEdt
+
+            l_diss = torch.relu(-p_diss_hat).mean()
+
+            loss = l_mean_inv_dyn + lam_E * l_mean_dEdt + lam_D * l_diss
+            #loss = l_mean_inv_dyn
             loss.backward()
             torch.nn.utils.clip_grad_norm_(delan_model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            # Update internal data:
+
             n_batches += 1
             l_mem += loss.item()
             l_mem_mean_inv_dyn += l_mean_inv_dyn.item()
             l_mem_var_inv_dyn += l_var_inv_dyn.item()
             l_mem_mean_dEdt += l_mean_dEdt.item()
             l_mem_var_dEdt += l_var_dEdt.item()
+            l_mem_mean_diss += l_diss.item()
 
             t_batch = time.perf_counter() - t0_batch
 
@@ -152,6 +170,7 @@ if __name__ == "__main__":
         l_mem_mean_dEdt /= float(n_batches)
         l_mem_var_dEdt /= float(n_batches)
         l_mem /= float(n_batches)
+        l_mem_mean_diss /= float(n_batches)
         epoch_i += 1
 
         if epoch_i == 1 or np.mod(epoch_i, 100) == 0:
@@ -159,19 +178,19 @@ if __name__ == "__main__":
             print("Time = {0:05.1f}s".format(time.perf_counter() - t0_start), end=", ")
             print("Loss = {0:.3e}".format(l_mem), end=", ")
             print("Inv Dyn = {0:.3e} \u00B1 {1:.3e}".format(l_mem_mean_inv_dyn, 1.96 * np.sqrt(l_mem_var_inv_dyn)), end=", ")
-            print("Power Con = {0:.3e} \u00B1 {1:.3e}".format(l_mem_mean_dEdt, 1.96 * np.sqrt(l_mem_var_dEdt)))
-
+            print("Power Con = {0:.3e} \u00B1 {1:.3e}".format(l_mem_mean_dEdt, 1.96 * np.sqrt(l_mem_var_dEdt)), end=", ")
+            print("Dissipation = {0:.3e}".format(l_mem_mean_diss))
     # Save the Model:
     if save_model:
-        #torch.save({"epoch": epoch_i,
-        #            "hyper": hyper,
-        #            "state_dict": delan_model.state_dict()},
-        #            "data/delan_model.torch")
-        # .pt saving
         torch.save({"epoch": epoch_i,
                     "hyper": hyper,
                     "state_dict": delan_model.state_dict()},
-                    "data/delan_model.pt")
+                    "data/delan_model.torch")
+        # .pt saving
+        #torch.save({"epoch": epoch_i,
+        #            "hyper": hyper,
+        #            "state_dict": delan_model.state_dict()},
+        #            "data/delan_model.pt")
 
     print("\n################################################")
     print("Evaluating DeLaN:")
@@ -189,11 +208,14 @@ if __name__ == "__main__":
     qdd = torch.from_numpy(test_qa).float().to(device)
     zeros = torch.zeros_like(q).float().to(device)
     # Compute the torque decomposition:
-    with torch.no_grad():
-        delan_g = delan_model.inv_dyn(q, zeros, zeros).cpu().numpy().squeeze()
-        delan_c = delan_model.inv_dyn(q, qd, zeros).cpu().numpy().squeeze() - delan_g
-        delan_m = delan_model.inv_dyn(q, zeros, qdd).cpu().numpy().squeeze() - delan_g
-
+    #with torch.no_grad():
+    with torch.enable_grad():
+        #delan_g = delan_model.inv_dyn(q, zeros, zeros).cpu().numpy().squeeze()
+        #delan_c = delan_model.inv_dyn(q, qd, zeros).cpu().numpy().squeeze() - delan_g
+        #delan_m = delan_model.inv_dyn(q, zeros, qdd).cpu().numpy().squeeze() - delan_g
+        delan_g = delan_model.inv_dyn(q, zeros, zeros).detach().cpu().numpy().squeeze()
+        delan_c = delan_model.inv_dyn(q, qd, zeros).detach().cpu().numpy().squeeze() - delan_g
+        delan_m = delan_model.inv_dyn(q, zeros, qdd).detach().cpu().numpy().squeeze() - delan_g
     t_batch = (time.perf_counter() - t0_batch) / (3. * float(test_qp.shape[0]))
 
     # Move model to the CPU:
@@ -206,33 +228,38 @@ if __name__ == "__main__":
     # delan_model.cpu()
     delan_model.eval()
     delan_tau, delan_dEdt = np.zeros(test_qp.shape), np.zeros((test_qp.shape[0], 1))
+    delan_tau_f, delan_p_diss = np.zeros(test_qp.shape), np.zeros((test_qp.shape[0], 1))
     t0_evaluation = time.perf_counter()
     for i in range(test_qp.shape[0]):
 
-        with torch.no_grad():
-
+        #with torch.no_grad():
+        with torch.enable_grad():
             # Convert NumPy samples to torch:
             #q = torch.from_numpy(test_qp[i]).float().view(1, -1).to(device)
             #qd = torch.from_numpy(test_qv[i]).float().view(1, -1).to(device)
             #qdd = torch.from_numpy(test_qa[i]).float().view(1, -1).to(device)
             q = torch.from_numpy(test_qp[i]).float().view(1, -1)
+            #qd = torch.from_numpy(test_qv[i]).float().view(1, -1).requires_grad_(True)
             qd = torch.from_numpy(test_qv[i]).float().view(1, -1)
             qdd = torch.from_numpy(test_qa[i]).float().view(1, -1)
             # Compute predicted torque:
             out = delan_model(q, qd, qdd)
-            delan_tau[i] = out[0].cpu().numpy().squeeze()
-            delan_dEdt[i] = out[1].cpu().numpy()
+            delan_tau[i] = out[0].detach().cpu().numpy().squeeze()
+            delan_dEdt[i] = out[1].detach().cpu().numpy()
+            delan_tau_f[i] = out[2].detach().cpu().numpy().squeeze()
+            delan_p_diss[i] = out[3].detach().cpu().numpy()
 
     t_eval = (time.perf_counter() - t0_evaluation) / float(test_qp.shape[0])
 
     # Compute Errors:
     test_dEdt = np.sum(test_tau * test_qv, axis=1).reshape((-1, 1))
+    target_dEdt = delan_dEdt + delan_p_diss  # DeLaN 预测的 dE/dt 是扣除耗散功率后的净功率
     err_g = 1. / float(test_qp.shape[0]) * np.sum((delan_g - test_g) ** 2)
     err_m = 1. / float(test_qp.shape[0]) * np.sum((delan_m - test_m) ** 2)
     err_c = 1. / float(test_qp.shape[0]) * np.sum((delan_c - test_c) ** 2)
     err_tau = 1. / float(test_qp.shape[0]) * np.sum((delan_tau - test_tau) ** 2)
-    err_dEdt = 1. / float(test_qp.shape[0]) * np.sum((delan_dEdt - test_dEdt) ** 2)
-
+    #err_dEdt = 1. / float(test_qp.shape[0]) * np.sum((delan_dEdt - test_dEdt) ** 2)
+    err_dEdt = 1. / float(test_qp.shape[0]) * np.sum((target_dEdt - test_dEdt) ** 2)  # 用扣除耗散功率后的净功率来评估能量一致性
     print("\nPerformance:")
     print("                Torque MSE = {0:.3e}".format(err_tau))
     print("              Inertial MSE = {0:.3e}".format(err_m))
